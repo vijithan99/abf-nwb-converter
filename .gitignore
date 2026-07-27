@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw electrophysiology data
+ABF Files/
+
+# Electrophysiology data files
+*.abf
+*.nwb
