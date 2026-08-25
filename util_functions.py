@@ -650,7 +650,6 @@ def patient_data_parse(abf_datetime_string, patient_data_path, protocol):
     return patient_date_db, csv_missing, tissue_type
 
 
-
 def patient_data_extract(patient_data):
     """
     Extract one row of patient metadata as plain Python values.

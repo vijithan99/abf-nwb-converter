@@ -5,32 +5,36 @@ Spyder Editor
 This is a temporary script file.
 """
 
-# General Helper Functions
-import util_functions
+from __future__ import annotations
 
-# Import python ABF library
-import pyabf
-import numpy as np
 import os
+import hashlib
+import json
+import math
+import re
+import sys
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path, PureWindowsPath
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-# Dataframe for opening CSVs
+import numpy as np
 import pandas as pd
-
-# Import I/O class used for reading and writing NWB files
-# Import main NWB file class
-from pynwb import NWBHDF5IO, NWBFile
-
-# Import additional core datatypes used in the example
+import pyabf
+import util_functions
+import metadata
+from hdmf.backends.hdf5.h5_utils import H5DataIO
+from pynwb import NWBHDF5IO, NWBFile, TimeSeries, validate
 from pynwb.file import Subject
-
-# Import icephys TimeSeries types used
 from pynwb.icephys import (
-    VoltageClampSeries,
-    VoltageClampStimulusSeries,
     CurrentClampSeries,
     CurrentClampStimulusSeries,
     IZeroClampSeries,
+    PatchClampSeries,
+    VoltageClampSeries,
+    VoltageClampStimulusSeries,
 )
 
 # Analyze ABF file
@@ -40,11 +44,24 @@ species = "human"
 
 input_abf_root = os.path.join(current_dir, "abfData")
 output_nwb_root = os.path.join(current_dir, "nwbData")
-patient_data_path = os.path.join(current_dir, "patientData", "patientData.csv")
+patient_data_path = os.path.join(current_dir, "patientData", "patientDataFormatted.csv")
 
-# V_CLAMP_MODE = 0
-# I_CLAMP_MODE = 1
-# I0_CLAMP_MODE = 2
+TORONTO_TZ = ZoneInfo("America/Toronto")
+PAPER_DOI = "https://doi.org/10.1093/gigascience/giac108"
+
+VOLTAGE_UNITS = {"v", "mv", "uv"}
+CURRENT_UNITS = {"a", "ma", "ua", "na", "pa"}
+
+SUBJECT_ID_COLUMNS = (
+    "subject_id",
+    "Subject ID",
+    "SubjectID",
+    "Patient ID",
+    "PatientID",
+    "patient_id",
+    "Study ID",
+    "StudyID",
+)
 
 # Cell Data missing Metadata
 dates_missing = set()
@@ -63,42 +80,7 @@ def nwb_conversion_from_unit(unit):
         return 1e-6, "amperes"
     raise ValueError(f"Unhandled ABF unit: {unit}")
 
-def get_metadata(abf):
-    metadata = {
-        "file": {
-            "version": abf.abfVersion,
-            "versionStr": abf.abfVersionString,
-            "protocol": abf.protocol,
-            "creator": abf.creator,
-            "ID": abf.abfID,
-            'file_path': abf.abfFilePath,
-            "comment": abf.abfFileComment,
-            "guid": abf.fileGUID,
-            "datetime": abf.abfDateTime,
-            "datetimestr": abf.abfDateTimeString,
-        },
-        
-        "acquisition": {
-            "sample_rate": abf.dataRate,
-            "sweeps": abf.sweepCount,
-            "points_per_sweep": abf.sweepPointCount,
-            "sweep_length_s": abf.sweepLengthSec,
-        },
-        
-        "channels": {
-            "count": abf.channelCount,
-            "names": abf.adcNames,
-            "units": abf.adcUnits,
-            # "gains": abf.adcGains,
-        },
-        
-        "clamp": {
-            # "mode": abf.clampMode,
-            # "mode_str": abf.clampModeString,
-        },
-    }
-    
-    return metadata
+
 
 def convert_abf_to_nwb(dirpath, filename, species = "human"):
     '''
@@ -108,7 +90,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     
     print(f"\nConverting {filename}")
     recordings = []
-    metadata = {}
+    # metadata = {}
     
     ## Make file directory strings to access ABF files and output folders for NWB files
     abf_path = os.path.join(dirpath, filename)
@@ -124,7 +106,9 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     )
     
     # Get ABF metadata
-    metadata = get_metadata(abf)
+    file_metadata = metadata.get_file_metadata(abf)
+    
+    patient_metadata = metadata.get_patient_metadata(filename, Path(patient_data_path), False)
 
     # Get comments/conditions
     conditions = abf._tagSection.sComment
@@ -136,9 +120,9 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     ## if species is human then extract data from the patient_data.csv
     if species == "human":
         patient_date_db, csv_missing, tissue_type = util_functions.patient_data_parse(
-            metadata['file']['datetimestr'],
+            file_metadata['file']['datetimestr'],
             patient_data_path,
-            metadata['file']['protocol']
+            file_metadata['file']['protocol']
         )
     
         if csv_missing:
@@ -246,24 +230,43 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     # Add sweep table
     # clamp_mode = abf._adcSection.nTelegraphMode[0]
     # abf_nwbfile.sweep_table = SweepTable()
+    
+    # Determine the response and recorded-stimulus ADC channels once per ABF.
+    channel_map = util_functions.find_file_level_channels(abf)
+    
+    response_channel = channel_map["response_channel"]
+    stim_channel = channel_map["stim_channel"]
+    
+    if response_channel is None:
+        raise ValueError(
+            f"Could not identify the response channel for {filename}. "
+            f"ADC names={abf.adcNames}, units={abf.adcUnits}"
+        )
+    
+    # Determine clamp mode before entering the sweep loop.
+    clamp_mode = util_functions.infer_clamp_mode(
+        abf,
+        response_channel=response_channel,
+    )
+
+    if clamp_mode == "unknown":
+        raise ValueError(
+            f"Could not determine clamp mode for {filename}"
+        )
 
     # Add sweeps
     for i in abf.sweepList:
-        rec_idx = None
-        abf_stimulus = None
-
-        abf.setSweep(i)
-        clamp_mode = util_functions.infer_clamp_mode(abf)
+        # This must occur after infer_clamp_mode(), because that function
+        # currently changes the active ABF sweep to sweep 0.
+        abf.setSweep(
+            i,
+            channel=response_channel,
+            absoluteTime=True,
+        )
         
-        if clamp_mode == "unknown":
-            raise ValueError(
-                f"Could not determine clamp mode for {filename}: "
-                f"Y={abf.sweepUnitsY}, C={abf.sweepUnitsC}"
-            )
-
-        dataX = abf.sweepX
-        dataY = abf.sweepY
-        dataStim = abf.sweepC
+        dataX = np.array(abf.sweepX, copy=True)
+        dataY = np.array(abf.sweepY, copy=True)
+        dataStim = np.array(abf.sweepC, copy=True)
         
         ## Convert the values to the units
         response_conversion, response_unit = nwb_conversion_from_unit(

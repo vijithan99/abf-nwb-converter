@@ -227,3 +227,6 @@ ABF Files/
 # Analysis files
 *.csv
 *.xlsx
+
+# Python files
+abf_to_nwb_fixed.py
