@@ -7,19 +7,36 @@ Created on Mon Aug 24 17:20:32 2026
 
 from pathlib import Path
 from typing import Any
+import re
 
 import pandas as pd
 
 
 SUBJECT_ID_COLUMNS = (
-    "Patient ID",
-    "Patient_ID",
-    "patient_id"
-    "Subject ID",
-    "Subject_ID",
     "subject_id",
+    "Subject ID",
+    "SubjectID",
+    "Patient ID",
+    "PatientID",
+    "patient_id",
+    "Study ID",
+    "StudyID",
 )
 
+LAYER_PATTERN = re.compile(
+    r"""
+    (?<![A-Za-z0-9])
+    (?:layer\s*|l\s*)
+    (?P<first>[1-6])
+    (?:
+        \s*[/&-]\s*(?P<second>[1-6])
+        |
+        (?P<suffix>[a-c])
+    )?
+    (?![A-Za-z0-9])
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
 
 def normalize_file_id(value: Any) -> str:
     """Normalize an ABF filename or file ID for comparison."""
@@ -77,7 +94,108 @@ def normalize_sex(sex: Any) -> str:
 
     return mapping[normalized]
 
+def get_abf_tag_comments(abf) -> list[str]:
+    """Collect and deduplicate tag comments from a pyABF object."""
+    comments: list[str] = []
+
+    def add_comments(values: Any) -> None:
+        if values is None:
+            return
+
+        if isinstance(values, str):
+            values = [values]
+        else:
+            try:
+                values = list(values)
+            except TypeError:
+                values = [values]
+
+        for value in values:
+            # Handle values such as (tag_time, tag_comment).
+            if isinstance(value, (list, tuple)) and value:
+                value = value[-1]
+
+            text = str(value).strip()
+
+            if text:
+                comments.append(text)
+
+    # Public pyABF interface.
+    add_comments(getattr(abf, "tagComments", None))
+
+    # Fallback for files where comments are only exposed privately.
+    tag_section = getattr(abf, "_tagSection", None)
+    add_comments(getattr(tag_section, "sComment", None))
+
+    # Optional general file comment.
+    add_comments(getattr(abf, "abfFileComment", None))
+
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(comments))
+
+
+
+
+def extract_layer_from_text(value: Any) -> str | None:
+    """
+    Extract and normalize a cortical layer from text.
+
+    Examples:
+        "l2/3"       -> "L2/3"
+        "Layer 5"    -> "L5"
+        "L2-3"       -> "L2/3"
+        "L2&3"       -> "L2/3"
+        "L3c"        -> "L3c"
+
+    Returns None when layer information is absent.
+    """
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    match = LAYER_PATTERN.search(text)
+
+    if match is None:
+        return None
+
+    first = match.group("first")
+    second = match.group("second")
+    suffix = match.group("suffix")
+
+    if second is not None:
+        return f"L{first}/{second}"
+
+    if suffix is not None:
+        return f"L{first}{suffix.lower()}"
+
+    return f"L{first}"
+
+def extract_layer_from_comments(comments: list[str]) -> tuple[str | None, str | None]:
+    """
+    Return the normalized layer and the comment it came from.
+
+    Returns:
+        (layer, source_comment)
+
+    If no layer is found:
+        (None, None)
+    """
+    for comment in comments:
+        layer = extract_layer_from_text(comment)
+
+        if layer is not None:
+            return layer, comment
+
+    return None, None
+
 def get_file_metadata(abf):
+    tag_comments = get_abf_tag_comments(abf)
+    layer, layer_source = extract_layer_from_comments(tag_comments)
+    
     metadata = {
         "file": {
             "version": abf.abfVersion,

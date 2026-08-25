@@ -24,7 +24,8 @@ import numpy as np
 import pandas as pd
 import pyabf
 import util_functions
-import metadata
+import metadata as md
+
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from pynwb import NWBHDF5IO, NWBFile, TimeSeries, validate
 from pynwb.file import Subject
@@ -52,17 +53,6 @@ PAPER_DOI = "https://doi.org/10.1093/gigascience/giac108"
 VOLTAGE_UNITS = {"v", "mv", "uv"}
 CURRENT_UNITS = {"a", "ma", "ua", "na", "pa"}
 
-SUBJECT_ID_COLUMNS = (
-    "subject_id",
-    "Subject ID",
-    "SubjectID",
-    "Patient ID",
-    "PatientID",
-    "patient_id",
-    "Study ID",
-    "StudyID",
-)
-
 # Cell Data missing Metadata
 dates_missing = set()
 
@@ -80,7 +70,43 @@ def nwb_conversion_from_unit(unit):
         return 1e-6, "amperes"
     raise ValueError(f"Unhandled ABF unit: {unit}")
 
+def _clean_optional(value: Any) -> Any | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "unknown", "no info", "n/a"}:
+        return None
+    return value
 
+
+def subject_from_metadata(species: str, metadata: dict[str, Any]) -> Subject:
+    if species == "human":
+        species_name = "Homo sapiens"
+        description_parts = ["De-identified human participant"]
+        for key, label in (("diagnosis", "diagnosis"), ("tumour", "tumour status")):
+            if _clean_optional(metadata.get(key)) is not None:
+                description_parts.append(f"{label}: {metadata[key]}")
+    else:
+        species_name = "Mus musculus"
+        description_parts = ["Laboratory mouse"]
+        for key in ("condition", "model"):
+            if _clean_optional(metadata.get(key)) is not None:
+                description_parts.append(f"{key}: {metadata[key]}")
+                
+    kwargs: dict[str, Any] = {
+        "subject_id": str(metadata["subject_id"]),
+        "description": "; ".join(description_parts),
+        "species": species_name,
+        "sex": str(metadata.get("sex") or "U"),
+    }
+    if metadata.get("age"):
+        kwargs["age"] = str(metadata["age"])
+    return Subject(**kwargs)
 
 def convert_abf_to_nwb(dirpath, filename, species = "human"):
     '''
@@ -90,7 +116,6 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     
     print(f"\nConverting {filename}")
     recordings = []
-    # metadata = {}
     
     ## Make file directory strings to access ABF files and output folders for NWB files
     abf_path = os.path.join(dirpath, filename)
@@ -106,9 +131,8 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     )
     
     # Get ABF metadata
-    file_metadata = metadata.get_file_metadata(abf)
-    
-    patient_metadata = metadata.get_patient_metadata(filename, Path(patient_data_path), False)
+    file_metadata = md.get_file_metadata(abf)
+    patient_metadata = md.get_patient_metadata(filename, Path(patient_data_path), False)
 
     # Get comments/conditions
     conditions = abf._tagSection.sComment
@@ -118,44 +142,10 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         conditions = conditions[0]
     
     ## if species is human then extract data from the patient_data.csv
-    if species == "human":
-        patient_date_db, csv_missing, tissue_type = util_functions.patient_data_parse(
-            file_metadata['file']['datetimestr'],
-            patient_data_path,
-            file_metadata['file']['protocol']
-        )
-    
-        if csv_missing:
-            dates_missing.add(csv_missing)
-    
-        has_patient_info = not patient_date_db.empty
-        structure, sex, age, tissue_type, tumour = util_functions.patient_data_extract(patient_date_db)
-
-        description = (
-            f"{conditions}; "
-            f"tissue type: {tissue_type}; "
-            f"tumour status: {tumour}; "
-            f"structure: {structure}"
-        )
     ## for mice data what to do
-    else:
-        mouse_meta = util_functions.parse_mouse_metadata_from_path(dirpath, input_abf_root)
-
-        has_patient_info = True
-    
-        structure = mouse_meta["structure"]
-        condition = mouse_meta["condition"]
-        model = mouse_meta["model"]
-        cell_type = mouse_meta["cell_type"]
-        tissue_type = mouse_meta["tissue_type"]
-    
-        sex = "unknown"
-        age = "unknown"
-        
-        description = f"{condition}; tissue type: {tissue_type}; structure: {structure}"
-        
+   
     ## Convert Start Time to Time Zone
-    session_start_time = metadata["file"]["datetime"]
+    session_start_time = file_metadata["file"]["datetime"]
 
     if session_start_time.tzinfo is None:
         session_start_time = (
@@ -170,12 +160,12 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
             "Whole-cell intracellular electrophysiology "
             "recording."
         ),
-        identifier=str(metadata["file"]["ID"]),
+        identifier=str(file_metadata["file"]["ID"]),
         session_start_time=session_start_time,
         experimenter="Homeira Moradi Chameh",
         lab="Neuron to Brain Lab",
         institution="Krembil Research Institute",
-        experiment_description=str(metadata["file"]["protocol"]),
+        experiment_description=str(file_metadata["file"]["protocol"]),
         session_id=os.path.splitext(filename)[0],
     )
 
@@ -185,47 +175,22 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     )
 
     # Add electrodes
-    adc_unit = metadata["channels"]["units"][0]
+    adc_unit = file_metadata["channels"]["units"][0]
 
     abf_electrode_rec = abf_nwbfile.create_icephys_electrode(
-        name="rec_" + metadata["channels"]["names"][0],
+        name="rec_" + file_metadata["channels"]["names"][0],
         description="recording electrode in " + adc_unit,
         device=abf_device,
     )
 
     dac_unit = None
 
-    if metadata["channels"]["count"] > 1:
-        dac_unit = metadata["channels"]["units"][1]
+    if file_metadata["channels"]["count"] > 1:
+        dac_unit = file_metadata["channels"]["units"][1]
 
     # Add subject info
-    if has_patient_info:
-        if species == "human":
-            subject_species = "Homo sapiens"
-            subject_description = (
-                f"{conditions}; tissue type: {tissue_type}; structure: {structure}"
-            )
-    
-        else:
-            subject_species = "Mus musculus"
-            subject_description = (
-                f"{conditions}; "
-                f"structure: {structure}; "
-                f"condition: {condition}; "
-                f"model: {model}; "
-                # f"cell type: {cell_type}; "
-                f"tissue type: {tissue_type}"
-            )
-            
-        subject = Subject(
-            subject_id=abf.abfDateTimeString,
-            age=str(age),
-            description=subject_description,
-            species=subject_species,
-            sex=str(sex),
-        )
-    
-        abf_nwbfile.subject = subject
+    subject = subject_from_metadata("human", patient_metadata)
+    abf_nwbfile.subject = subject
 
     # Add sweep table
     # clamp_mode = abf._adcSection.nTelegraphMode[0]
@@ -287,7 +252,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                 unit=response_unit,
                 conversion=response_conversion,
                 starting_time=float(dataX[0]),
-                rate=float(metadata["acquisition"]["sample_rate"]),
+                rate=float(file_metadata["acquisition"]["sample_rate"]),
                 electrode=abf_electrode_rec,
                 gain=abf._dataGain[0],
                 sweep_number=np.uint64(i),
@@ -296,7 +261,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
 
             abf_nwbfile.add_acquisition(abf_response)
 
-            if metadata["channels"]["count"] > 1:
+            if file_metadata["channels"]["count"] > 1:
                 stim_name = f"Index_0_{i}_1 {dac_unit}"
 
                 abf_stimulus = VoltageClampStimulusSeries(
@@ -305,7 +270,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                     unit=stimulus_unit,
                     conversion=stimulus_conversion,
                     starting_time=float(dataX[0]),
-                    rate=float(metadata["acquisition"]["sample_rate"]),
+                    rate=float(file_metadata["acquisition"]["sample_rate"]),
                     electrode=abf_electrode_rec,
                     gain=abf._dataGain[1],
                     sweep_number=np.uint64(i),
@@ -323,7 +288,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                 unit=response_unit,
                 conversion=response_conversion,
                 starting_time=float(dataX[0]),
-                rate=float(metadata["acquisition"]["sample_rate"]),
+                rate=float(file_metadata["acquisition"]["sample_rate"]),
                 electrode=abf_electrode_rec,
                 gain=abf._dataGain[0],
                 sweep_number=np.uint64(i),
@@ -332,7 +297,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
 
             abf_nwbfile.add_acquisition(abf_response)
 
-            if metadata["channels"]["count"] > 1:
+            if file_metadata["channels"]["count"] > 1:
                 stim_name = f"Index_0_{i}_1 {dac_unit}"
 
                 abf_stimulus = CurrentClampStimulusSeries(
@@ -341,7 +306,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                     unit=stimulus_unit,
                     conversion=stimulus_conversion,
                     starting_time=float(dataX[0]),
-                    rate=float(metadata["acquisition"]["sample_rate"]),
+                    rate=float(file_metadata["acquisition"]["sample_rate"]),
                     electrode=abf_electrode_rec,
                     gain=abf._dataGain[1],
                     sweep_number=np.uint64(i),
@@ -359,7 +324,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                 unit=response_unit,
                 conversion=response_conversion,
                 starting_time=float(dataX[0]),
-                rate=float(metadata["acquisition"]["sample_rate"]),
+                rate=float(file_metadata["acquisition"]["sample_rate"]),
                 electrode=abf_electrode_rec,
                 gain=abf._dataGain[0],
                 sweep_number=np.uint64(i),
