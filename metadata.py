@@ -6,11 +6,14 @@ Created on Mon Aug 24 17:20:32 2026
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 import re
 
 import pandas as pd
 
+## File Details
+experimenter = "Moradi Chameh, Homeira"
+lab = "Neuron to Brain Lab"
 
 SUBJECT_ID_COLUMNS = (
     "subject_id",
@@ -37,6 +40,17 @@ LAYER_PATTERN = re.compile(
     """,
     flags=re.IGNORECASE | re.VERBOSE,
 )
+    
+CELL_ID_PATTERNS = (
+    re.compile(
+        r"(?<![A-Za-z0-9])C\s*[:#-]?\s*(?P<cell_id>[0-9]{1,4}[A-Za-z]?)(?![A-Za-z0-9])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcell\s*[:#-]?\s*(?P<cell_id>[A-Za-z0-9._-]+)\b",
+        flags=re.IGNORECASE,
+    ),
+)
 
 def normalize_file_id(value: Any) -> str:
     """Normalize an ABF filename or file ID for comparison."""
@@ -47,26 +61,11 @@ def normalize_file_id(value: Any) -> str:
 
 def iso8601_convert(age: Any):
     """Convert an age in years to an ISO 8601 duration."""
-    if pd.isna(age):
+    if pd.isna(age) or not str(age).strip():
         return None
 
-    age_text = str(age).strip()
-
-    if not age_text:
-        return None
-
-    # Preserve ages that are already ISO 8601 formatted.
-    if age_text.upper().startswith("P"):
-        return age_text.upper()
-
-    try:
-        numeric_age = float(age_text)
-    except ValueError as error:
-        raise ValueError(
-            f"Age must be numeric or ISO 8601 formatted, received {age!r}"
-        ) from error
-
-    return f"P{numeric_age:g}Y"
+    years = int(age)
+    return f"P{years:g}Y"
 
 def normalize_sex(sex: Any) -> str:
     """Convert common sex labels to NWB-compatible values."""
@@ -134,8 +133,6 @@ def get_abf_tag_comments(abf) -> list[str]:
     return list(dict.fromkeys(comments))
 
 
-
-
 def extract_layer_from_text(value: Any) -> str | None:
     """
     Extract and normalize a cortical layer from text.
@@ -174,6 +171,7 @@ def extract_layer_from_text(value: Any) -> str | None:
 
     return f"L{first}"
 
+
 def extract_layer_from_comments(comments: list[str]) -> tuple[str | None, str | None]:
     """
     Return the normalized layer and the comment it came from.
@@ -192,9 +190,32 @@ def extract_layer_from_comments(comments: list[str]) -> tuple[str | None, str | 
 
     return None, None
 
+def extract_cell_id_from_comments(comments: Iterable[str]) -> tuple[str | None, str | None]:
+    """Return ``(cell_id, source_comment)`` for the first ABF cell label found."""
+    for comment in comments:
+        text = str(comment)
+        for index, pattern in enumerate(CELL_ID_PATTERNS):
+            match = pattern.search(text)
+            if match is None:
+                continue
+
+            parsed_id = match.group("cell_id").strip()
+            cell_id = f"C{parsed_id}" if index == 0 else parsed_id
+            return cell_id, text
+
+    return None, None
+
+
+def extract_cell_id_from_abf_tags(abf: Any) -> tuple[str | None, str | None]:
+    """Extract a cell identifier and its source comment from an ABF object."""
+    return extract_cell_id_from_comments(get_abf_tag_comments(abf))
+
+
 def get_file_metadata(abf):
     tag_comments = get_abf_tag_comments(abf)
     layer, layer_source = extract_layer_from_comments(tag_comments)
+    cell_id, cell_id_source = extract_cell_id_from_comments(tag_comments)
+
     
     metadata = {
         "file": {
@@ -222,6 +243,12 @@ def get_file_metadata(abf):
             "names": abf.adcNames,
             "units": abf.adcUnits,
             # "gains": abf.adcGains,
+        },
+        
+        "ephys": {
+            "comments": tag_comments,
+            "layer": layer,
+            "layer_source": layer_source
         },
         
         "clamp": {

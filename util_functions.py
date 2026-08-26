@@ -11,9 +11,6 @@ import numpy as np
 import os
 import re
 
-## File Details
-experimenter = "Homeira Moradi Chameh"
-lab = "Neuron to Brain Lab"
 
 # Adjust if needed after reviewing your dataset
 RMP_MIN_MV = -100.0
