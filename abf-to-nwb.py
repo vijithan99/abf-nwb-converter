@@ -41,11 +41,12 @@ from pynwb.icephys import (
 # Analyze ABF file
 current_dir = os.getcwd()
 
-species = "human"
+species = "mice"
 
-input_abf_root = os.path.join(current_dir, "abfData")
+input_abf_root = os.path.join(current_dir, "miceabfData")
 output_nwb_root = os.path.join(current_dir, "nwbData")
-patient_data_path = os.path.join(current_dir, "patientData", "patientDataFormatted.csv")
+patient_data_path = os.path.join(current_dir, "patientData", "patientData.csv")
+mouse_data_path = os.path.join(current_dir, "patientData", "mouseData.csv")
 
 TORONTO_TZ = ZoneInfo("America/Toronto")
 PAPER_DOI = "https://doi.org/10.1093/gigascience/giac108"
@@ -55,6 +56,9 @@ CURRENT_UNITS = {"a", "ma", "ua", "na", "pa"}
 
 # Cell Data missing Metadata
 dates_missing = set()
+
+converted = 0
+failures = []
 
 def nwb_conversion_from_unit(unit):
     unit = unit.lower()
@@ -155,7 +159,11 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     # ---------------------------------------------------------
     # Subject metadata
     # ---------------------------------------------------------    
-    patient_metadata = md.get_patient_metadata(filename, Path(patient_data_path), False)
+    if species == "human":
+        patient_metadata = md.get_patient_metadata(filename, Path(patient_data_path), False)
+    else:
+        patient_metadata = md.get_mouse_metadata(filename, Path(mouse_data_path), False)
+
 
     # Get comments/conditions
     conditions = abf._tagSection.sComment
@@ -254,7 +262,11 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         manufacturer="Molecular Devices",
     )
     # Store the layer and a unique cell ID on the IntracellularElectrode.
-    layer = file_metadata["ephys"].get("layer")
+    layer = (
+        file_metadata["ephys"].get("layer")
+        or patient_metadata.get("layer")
+    )
+    
     cell_id = file_metadata["ephys"].get("cell_id")
     if cell_id is None:
         cell_id = f"cell-{file_metadata['file']['ID']}"
@@ -429,6 +441,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
             "clamp_mode": clamp_mode,
         },
     }
+    
     abf_nwbfile.add_scratch(
         json.dumps(conversion_metadata, sort_keys=True, default=str),
         name="conversion_metadata",
@@ -453,9 +466,14 @@ for dirpath, dirnames, filenames in os.walk(input_abf_root):
         
         try:
             convert_abf_to_nwb(dirpath, filename, species)
+            converted += 1
             print("Success!")
         except Exception as e:
-            print(f"Failed to convert {filename}: {e}")
-        
-        
+            failures.append((os.path.join(dirpath, filename), e))
+            print(f"Failed to convert {filename}: {e}", file=sys.stderr)
+            
+        if failures:
+            print(f"{len(failures)} conversion(s) failed:", file=sys.stderr)
+            for path, exc in failures:
+                print(f"- {path}: {exc}", file=sys.stderr)
         

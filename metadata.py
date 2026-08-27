@@ -24,6 +24,9 @@ SUBJECT_ID_COLUMNS = (
     "patient_id",
     "Study ID",
     "StudyID",
+    "Mouse ID",
+    "mouse_id",
+    "MouseID",
 )
 
 LAYER_PATTERN = re.compile(
@@ -60,12 +63,19 @@ def normalize_file_id(value: Any) -> str:
     return Path(str(value).strip()).stem.casefold()
 
 def iso8601_convert(age: Any):
-    """Convert an age in years to an ISO 8601 duration."""
+    """Convert an age in time to an ISO 8601 duration."""
     if pd.isna(age) or not str(age).strip():
         return None
+    
+    text = str(age).strip().lower()
 
-    years = int(age)
-    return f"P{years:g}Y"
+    if "weeks" in text:
+        weeks = int(re.findall("\d+", text)[0])
+        return f"P{weeks:g}W"
+    
+    else:
+        years = int(age)
+        return f"P{years:g}Y"
 
 def normalize_sex(sex: Any) -> str:
     """Convert common sex labels to NWB-compatible values."""
@@ -78,8 +88,10 @@ def normalize_sex(sex: Any) -> str:
     mapping = {
         "m": "M",
         "male": "M",
+        "Male": "M",
         "f": "F",
         "female": "F",
+        "Female": "F",
         "u": "U",
         "unknown": "U",
         "o": "O",
@@ -215,7 +227,6 @@ def get_file_metadata(abf):
     tag_comments = get_abf_tag_comments(abf)
     layer, layer_source = extract_layer_from_comments(tag_comments)
     cell_id, cell_id_source = extract_cell_id_from_comments(tag_comments)
-
     
     metadata = {
         "file": {
@@ -248,7 +259,9 @@ def get_file_metadata(abf):
         "ephys": {
             "comments": tag_comments,
             "layer": layer,
-            "layer_source": layer_source
+            "layer_source": layer_source,
+            "cell_id": cell_id,
+            "cell_id_source": cell_id_source,
         },
         
         "clamp": {
@@ -329,5 +342,77 @@ def get_patient_metadata(file_name: str, patient_data_path: Path, strict_subject
             "tissue_type": row["Tissue Type"],
             "tumour": row["Tumor"],
             "structure": row["Tissue Location"],
-            "medication": row["Antiseziure Medications Used"],
+            "layer": row.get("Cortical Layer"),
+            "external_solution": row.get("External Solution"),
+            "medication": row["Antiseizure Medications Used"],
         }
+    
+def get_mouse_metadata(file_name: str, mouse_data_path: Path, strict_subject_id: bool = False) -> dict[str, Any]:
+    if not mouse_data_path.exists():
+        raise FileNotFoundError(
+            f"Mice metadata file was not found: {mouse_data_path}"
+        )
+        
+    if mouse_data_path is not None and mouse_data_path.exists():
+        database = pd.read_csv(mouse_data_path)
+        if "File ID" not in database.columns:
+            raise ValueError(
+                f"Patient metadata file {mouse_data_path} is missing the 'File ID' column"
+            )
+            
+        target_file_id = normalize_file_id(file_name)
+
+        matches = database.loc[
+            database["File ID"].map(normalize_file_id) == target_file_id
+        ]
+    
+        if matches.empty:
+            raise LookupError(
+                f"No mouse metadata was found for {file_name}"
+            )
+    
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple mouse metadata rows matched {file_name}"
+            )
+    
+        row = matches.iloc[0]
+    
+        subject_id_column = next(
+            (
+                column
+                for column in SUBJECT_ID_COLUMNS
+                if column in database.columns
+            ),
+            None,
+        )
+    
+        if subject_id_column is None:
+            if strict_subject_id:
+                raise ValueError(
+                    "No subject-ID column was found in the metadata file."
+                )
+            subject_id = None
+        else:
+            subject_id = row[subject_id_column]
+    
+            if pd.isna(subject_id) or not str(subject_id).strip():
+                if strict_subject_id:
+                    raise ValueError(
+                        f"Mouse ID is missing for {file_name}"
+                    )
+                subject_id = None
+            else:
+                subject_id = str(subject_id).strip()
+    
+        return {
+            "subject_id": subject_id,
+            "age": iso8601_convert(row["Age (recording day)"]),
+            "sex": normalize_sex(row["Sex"]),
+            "condition": row["Condition (KA/SA)"],
+            "seizure_type": row["Focal/Generalized"],
+            "strain": row["Strain"],
+            "layer": row["Cortical Layer"],
+            "external_solution": row.get("External Solution")
+        }
+    
