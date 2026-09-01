@@ -261,6 +261,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         description="Patch-clamp amplifier connected to the selected response ADC channel.",
         manufacturer="Molecular Devices",
     )
+    
     # Store the layer and a unique cell ID on the IntracellularElectrode.
     layer = (
         file_metadata["ephys"].get("layer")

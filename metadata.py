@@ -412,6 +412,7 @@ def get_mouse_metadata(file_name: str, mouse_data_path: Path, strict_subject_id:
             "condition": row["Condition (KA/SA)"],
             "seizure_type": row["Focal/Generalized"],
             "strain": row["Strain"],
+            "structure": row["Tissue Location"],
             "layer": row["Cortical Layer"],
             "external_solution": row.get("External Solution")
         }
