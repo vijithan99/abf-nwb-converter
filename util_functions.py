@@ -1431,133 +1431,101 @@ def normalize_unit(unit):
         .replace("μ", "u")
     )
 
-def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
-    """Select the *output* used for the command, independently of the response ADC.
-
-    pyABF's sweepC follows the channel passed to setSweep(). Inspect every
-    compatible output across all sweeps: a zero-current sweep (or the first
-    sweep of a series) must not cause the actual output to be overlooked.
-    A second active output requires an explicit override rather than a guess.
-    None means that the ABF does not expose a usable command waveform.
+def find_command_dac_index(abf, clamp_mode):
     """
-    expected_units = {
-        "current_clamp": {"a", "ma", "ua", "na", "pa"},
-        "voltage_clamp": {"v", "mv", "uv"},
-    }.get(clamp_mode)
-    if expected_units is None:
-        return None
+    Find the DAC whose unit matches the expected command type.
 
-    dac_units = getattr(abf, "dacUnits", [])
-    candidates = [
-        index for index, unit in enumerate(dac_units)
-        if normalize_unit(unit) in expected_units
-        and index in abf.channelList
-    ]
-    if override is not None:
-        override = int(override)
-        if override not in candidates:
-            raise ValueError(
-                f"DAC override {override} is unavailable or has the wrong "
-                f"unit for {clamp_mode}; candidates={candidates}, "
-                f"DAC units={dac_units}"
-            )
-        return override
+    current_clamp:
+        command must be current
 
-    enabled_flags = getattr(getattr(abf, "_dacSection", None),
-                            "nWaveformEnable", [])
-    findings = []
-    for channel in candidates:
-        dynamic_sweeps = 0
-        nonzero_sweeps = 0
-        for sweep in abf.sweepList:
-            try:
-                abf.setSweep(int(sweep), channel=channel)
-                command = np.asarray(abf.sweepC)
-                if not command.size or not np.all(np.isfinite(command)):
-                    continue
-                dynamic_sweeps += bool(np.ptp(command) > zero_tol)
-                nonzero_sweeps += bool(np.max(np.abs(command)) > zero_tol)
-            except (FileNotFoundError, OSError, ValueError, IndexError):
-                # In particular, an ABF may refer to a missing external
-                # stimulus file. The recorded ADC fallback can still work.
-                continue
-        findings.append({
-            "channel": channel,
-            "dynamic": dynamic_sweeps,
-            "nonzero": nonzero_sweeps,
-            "enabled": (channel < len(enabled_flags)
-                        and bool(enabled_flags[channel])),
-        })
+    voltage_clamp:
+        command must be voltage
+    """
 
-    # Changes within a sweep are stronger evidence than a constant holding
-    # level. A constant nonzero voltage command can still be meaningful.
-    active = [item for item in findings if item["dynamic"]]
-    if not active:
-        active = [item for item in findings if item["nonzero"]]
-    if len(active) > 1:
-        enabled = [item for item in active if item["enabled"]]
-        if len(enabled) == 1:
-            active = enabled
-    if len(active) > 1:
-        raise ValueError(
-            f"Several {clamp_mode} command DACs are active: {active}. "
-            "Specify a DAC override after reviewing the protocol."
+    voltage_units = {"v", "mv", "uv"}
+    current_units = {"a", "ma", "ua", "na", "pa"}
+
+    if clamp_mode == "current_clamp":
+        expected_units = current_units
+        preferred_names = (
+            "iclamp",
+            "i_clamp",
+            "current",
         )
-    return active[0]["channel"] if active else None
 
+    elif clamp_mode == "voltage_clamp":
+        expected_units = voltage_units
+        preferred_names = (
+            "vclamp",
+            "v_clamp",
+            "voltage",
+            "cmd",
+        )
 
-def find_stimulus_source(abf, clamp_mode, recorded_channel=None,
-                         response_channel=None, dac_override=None):
-    """Return a file-level source for the full stimulus waveform, or None.
-
-    Prefer the ideal DAC command reconstructed from ABF epochs or a referenced
-    stimulus file. When no command is available in current clamp, use a
-    separately recorded current-monitor ADC only if it contains a clear step.
-    The result records whether it is a command or a measured current trace.
-    """
-    dac = find_command_dac_index(abf, clamp_mode, override=dac_override)
-    if dac is not None:
-        return {"source": "dac_command", "channel": dac,
-                "unit": str(abf.dacUnits[dac])}
-
-    if (clamp_mode == "current_clamp" and recorded_channel is not None
-            and recorded_channel != response_channel
-            and normalize_unit(abf.adcUnits[recorded_channel])
-            in {"a", "ma", "ua", "na", "pa"}):
-        threshold_by_unit = {
-            "pa": 5.0, "na": 5e-3, "ua": 5e-6,
-            "ma": 5e-9, "a": 5e-12,
-        }
-        min_step_amp = threshold_by_unit[
-            normalize_unit(abf.adcUnits[recorded_channel])
-        ]
-        for sweep in abf.sweepList:
-            abf.setSweep(int(sweep), channel=recorded_channel)
-            start, end, amp, mode = detect_long_square_from_current_trace(
-                time=abf.sweepX, current_trace=abf.sweepY,
-                min_step_amp=min_step_amp,
-            )
-            if start is not None and end is not None and mode == "Long":
-                return {"source": "recorded_current_adc",
-                        "channel": recorded_channel,
-                        "unit": str(abf.adcUnits[recorded_channel])}
-    return None
-
-
-def get_stimulus_waveform(abf, sweep_number, source):
-    """Return the native-unit waveform and its unit for one ABF sweep."""
-    if source is None:
-        return None
-    abf.setSweep(int(sweep_number), channel=source["channel"])
-    if source["source"] == "dac_command":
-        values = np.array(abf.sweepC, copy=True)
-    elif source["source"] == "recorded_current_adc":
-        values = np.array(abf.sweepY, copy=True)
     else:
-        raise ValueError(f"Unknown stimulus source: {source['source']}")
-    if not values.size or not np.all(np.isfinite(values)):
-        raise ValueError(f"Invalid stimulus waveform in sweep {sweep_number}")
-    return values, source["unit"]
+        return None
+
+    dac_units = [
+        normalize_unit(unit)
+        for unit in getattr(abf, "dacUnits", [])
+    ]
+
+    dac_names = [
+        str(name).strip().lower()
+        for name in getattr(abf, "dacNames", [])
+    ]
+
+    waveform_enabled = list(
+        getattr(
+            getattr(abf, "_dacSection", None),
+            "nWaveformEnable",
+            [],
+        )
+    )
+
+    candidates = []
+
+    for dac_index, dac_unit in enumerate(dac_units):
+        if dac_unit not in expected_units:
+            continue
+
+        enabled = (
+            not waveform_enabled
+            or dac_index >= len(waveform_enabled)
+            or bool(waveform_enabled[dac_index])
+        )
+
+        name = (
+            dac_names[dac_index]
+            if dac_index < len(dac_names)
+            else ""
+        )
+
+        name_score = sum(
+            keyword in name
+            for keyword in preferred_names
+        )
+
+        candidates.append(
+            {
+                "index": dac_index,
+                "enabled": enabled,
+                "name_score": name_score,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: (
+            item["enabled"],
+            item["name_score"],
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]["index"]
 
 def infer_clamp_mode(abf, response_channel=0):
     abf.setSweep(0, channel=response_channel)
