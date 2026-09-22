@@ -1431,21 +1431,19 @@ def normalize_unit(unit):
         .replace("μ", "u")
     )
 
-def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
-    """Select the *output* used for the command, independently of the response ADC.
+def find_command_dac_candidates(abf, clamp_mode, zero_tol=1e-9):
+    """Find active, unit-compatible DACs with one aligned waveform per sweep.
 
-    pyABF's sweepC follows the channel passed to setSweep(). Inspect every
-    compatible output across all sweeps: a zero-current sweep (or the first
-    sweep of a series) must not cause the actual output to be overlooked.
-    A second active output requires an explicit override rather than a guess.
-    None means that the ABF does not expose a usable command waveform.
+    Matching sweep count and sample count establishes alignment, not which
+    output actually delivered the stimulus. Return all active outputs so an
+    ambiguous file can retain every candidate waveform in NWB.
     """
     expected_units = {
         "current_clamp": {"a", "ma", "ua", "na", "pa"},
         "voltage_clamp": {"v", "mv", "uv"},
     }.get(clamp_mode)
     if expected_units is None:
-        return None
+        return []
 
     dac_units = getattr(abf, "dacUnits", [])
     candidates = [
@@ -1453,28 +1451,21 @@ def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
         if normalize_unit(unit) in expected_units
         and index in abf.channelList
     ]
-    if override is not None:
-        override = int(override)
-        if override not in candidates:
-            raise ValueError(
-                f"DAC override {override} is unavailable or has the wrong "
-                f"unit for {clamp_mode}; candidates={candidates}, "
-                f"DAC units={dac_units}"
-            )
-        return override
-
     enabled_flags = getattr(getattr(abf, "_dacSection", None),
                             "nWaveformEnable", [])
     findings = []
     for channel in candidates:
         dynamic_sweeps = 0
         nonzero_sweeps = 0
+        aligned_sweeps = 0
         for sweep in abf.sweepList:
             try:
                 abf.setSweep(int(sweep), channel=channel)
                 command = np.asarray(abf.sweepC)
-                if not command.size or not np.all(np.isfinite(command)):
+                if (not command.size or not np.all(np.isfinite(command))
+                        or command.shape != np.asarray(abf.sweepY).shape):
                     continue
+                aligned_sweeps += 1
                 dynamic_sweeps += bool(np.ptp(command) > zero_tol)
                 nonzero_sweeps += bool(np.max(np.abs(command)) > zero_tol)
             except (FileNotFoundError, OSError, ValueError, IndexError):
@@ -1485,25 +1476,74 @@ def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
             "channel": channel,
             "dynamic": dynamic_sweeps,
             "nonzero": nonzero_sweeps,
+            "aligned_sweeps": aligned_sweeps,
             "enabled": (channel < len(enabled_flags)
                         and bool(enabled_flags[channel])),
         })
 
     # Changes within a sweep are stronger evidence than a constant holding
     # level. A constant nonzero voltage command can still be meaningful.
-    active = [item for item in findings if item["dynamic"]]
+    active = [item for item in findings
+              if item["aligned_sweeps"] == len(abf.sweepList)
+              and item["dynamic"]]
     if not active:
-        active = [item for item in findings if item["nonzero"]]
-    if len(active) > 1:
-        enabled = [item for item in active if item["enabled"]]
-        if len(enabled) == 1:
-            active = enabled
-    if len(active) > 1:
+        active = [item for item in findings
+                  if item["aligned_sweeps"] == len(abf.sweepList)
+                  and item["nonzero"]]
+    return sorted(active, key=lambda item: item["channel"])
+
+
+def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
+    """Return one DAC index for older callers; refuse an unsupported tie."""
+    candidates = find_command_dac_candidates(abf, clamp_mode, zero_tol)
+    indices = [item["channel"] for item in candidates]
+    if override is not None:
+        if int(override) not in indices:
+            raise ValueError(f"DAC override {override} is not active: {indices}")
+        return int(override)
+    enabled = [item["channel"] for item in candidates if item["enabled"]]
+    if len(indices) > 1 and len(enabled) != 1:
         raise ValueError(
-            f"Several {clamp_mode} command DACs are active: {active}. "
-            "Specify a DAC override after reviewing the protocol."
+            f"Multiple active DACs: {indices}. Use find_stimulus_source "
+            "to retain all candidates, or specify an override."
         )
-    return active[0]["channel"] if active else None
+    return (enabled or indices or [None])[0]
+
+
+def _dac_commands_identical(abf, indices):
+    """An identical command on every sweep makes either DAC equivalent."""
+    if len({normalize_unit(abf.dacUnits[ch]) for ch in indices}) != 1:
+        return False
+    for sweep in abf.sweepList:
+        abf.setSweep(int(sweep), channel=indices[0])
+        reference = np.array(abf.sweepC, copy=True)
+        for channel in indices[1:]:
+            abf.setSweep(int(sweep), channel=channel)
+            if not np.allclose(reference, abf.sweepC, rtol=1e-6, atol=1e-9):
+                return False
+    return True
+
+
+def _command_monitor_correlation(abf, dac, recorded_channel):
+    """Compare stimulus and recorded current shapes across the same sweeps."""
+    commands, monitors = [], []
+    for sweep in abf.sweepList:
+        abf.setSweep(int(sweep), channel=dac)
+        command = np.asarray(abf.sweepC)
+        abf.setSweep(int(sweep), channel=recorded_channel)
+        monitor = np.asarray(abf.sweepY)
+        if command.shape != monitor.shape:
+            return float("nan")
+        stride = max(1, len(command) // 500)
+        command = command[::stride].astype(float)
+        monitor = monitor[::stride].astype(float)
+        baseline_size = max(1, len(command) // 20)
+        commands.append(command - np.median(command[:baseline_size]))
+        monitors.append(monitor - np.median(monitor[:baseline_size]))
+    x, y = np.concatenate(commands), np.concatenate(monitors)
+    if np.std(x) == 0 or np.std(y) == 0:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
 
 
 def find_stimulus_source(abf, clamp_mode, recorded_channel=None,
@@ -1515,10 +1555,56 @@ def find_stimulus_source(abf, clamp_mode, recorded_channel=None,
     separately recorded current-monitor ADC only if it contains a clear step.
     The result records whether it is a command or a measured current trace.
     """
-    dac = find_command_dac_index(abf, clamp_mode, override=dac_override)
-    if dac is not None:
-        return {"source": "dac_command", "channel": dac,
-                "unit": str(abf.dacUnits[dac])}
+    candidates = find_command_dac_candidates(abf, clamp_mode)
+    indices = [item["channel"] for item in candidates]
+    if dac_override is not None and int(dac_override) not in indices:
+        raise ValueError(f"DAC override {dac_override} is not active: {indices}")
+    if candidates:
+        chosen = None
+        reason = "single_active_dac" if len(candidates) == 1 else None
+        if dac_override is not None:
+            chosen = int(dac_override)
+            reason = "manual_dac_override"
+        elif len(candidates) == 1:
+            chosen = indices[0]
+        else:
+            if _dac_commands_identical(abf, indices):
+                chosen, reason = indices[0], "identical_dac_commands"
+            # The acquired current monitor can identify a command by its
+            # timing and amplitude pattern, even if both DACs have pA units.
+            if (chosen is None and clamp_mode == "current_clamp"
+                    and recorded_channel is not None
+                    and recorded_channel != response_channel
+                    and normalize_unit(abf.adcUnits[recorded_channel])
+                    in {"a", "ma", "ua", "na", "pa"}):
+                correlations = {
+                    ch: _command_monitor_correlation(abf, ch, recorded_channel)
+                    for ch in indices
+                }
+                ranked = sorted(
+                    [(ch, abs(value)) for ch, value in correlations.items()
+                     if np.isfinite(value)],
+                    key=lambda item: item[1], reverse=True,
+                )
+                if (ranked and ranked[0][1] >= 0.8
+                        and (len(ranked) == 1
+                             or ranked[0][1] - ranked[1][1] >= 0.1)):
+                    chosen, reason = ranked[0][0], "recorded_monitor_match"
+            if chosen is None:
+                enabled = [item["channel"] for item in candidates
+                           if item["enabled"]]
+                if len(enabled) == 1:
+                    chosen, reason = enabled[0], "only_enabled_dac"
+            if chosen is None:
+                # Deterministic for reproducibility. Preserve all alternatives
+                # and do not claim an unverified stimulus/response pairing.
+                chosen, reason = indices[0], "ambiguous_unverified"
+
+        return {"source": "dac_command", "channel": chosen,
+                "unit": str(abf.dacUnits[chosen]),
+                "candidate_channels": indices,
+                "alternative_channels": [ch for ch in indices if ch != chosen],
+                "selection_reason": reason}
 
     if (clamp_mode == "current_clamp" and recorded_channel is not None
             and recorded_channel != response_channel
@@ -1540,7 +1626,9 @@ def find_stimulus_source(abf, clamp_mode, recorded_channel=None,
             if start is not None and end is not None and mode == "Long":
                 return {"source": "recorded_current_adc",
                         "channel": recorded_channel,
-                        "unit": str(abf.adcUnits[recorded_channel])}
+                        "unit": str(abf.adcUnits[recorded_channel]),
+                        "candidate_channels": [], "alternative_channels": [],
+                        "selection_reason": "recorded_current_step"}
     return None
 
 

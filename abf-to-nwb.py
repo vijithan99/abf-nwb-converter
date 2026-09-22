@@ -270,6 +270,16 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
             f"No trustworthy stimulus found for {filename}; recording the "
             "response without a fabricated zero-valued stimulus."
         )
+    unverified_dac = (
+        stimulus_source is not None
+        and stimulus_source.get("selection_reason") == "ambiguous_unverified"
+    )
+    if unverified_dac:
+        warnings.warn(
+            f"Multiple active command DACs in {filename}: "
+            f"{stimulus_source['candidate_channels']}. Keeping all waveforms "
+            "without assigning one to the response; review the source metadata."
+        )
 
     # Add the amplifier/device with a non-empty description.
     try:
@@ -372,7 +382,10 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         if clamp_mode == "voltage_clamp":
             abf_response = VoltageClampSeries(
                 **response_common,
-                stimulus_description="ABF voltage command",
+                stimulus_description=(
+                    "Multiple possible ABF voltage commands" if unverified_dac
+                    else "ABF voltage command"
+                ),
             )
             if command_data is not None:
                 stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(command_native_unit)
@@ -388,14 +401,18 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                     stimulus_description="ABF voltage command",
                     description=(
                         f"Ideal DAC{stimulus_source['channel']} command reconstructed "
-                        f"by PyABF for sweep {i}; native unit {command_native_unit}."
+                        f"by PyABF for sweep {i}; native unit {command_native_unit}; "
+                        f"selection={stimulus_source['selection_reason']}."
                     ),
                 )
 
         elif clamp_mode == "current_clamp":
             abf_response = CurrentClampSeries(
                 **response_common,
-                stimulus_description="ABF current stimulus",
+                stimulus_description=(
+                    "Multiple possible ABF current commands" if unverified_dac
+                    else "ABF current stimulus"
+                ),
             )
             if command_data is not None:
                 stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(command_native_unit)
@@ -416,7 +433,8 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
                     description=(
                         f"{'Ideal DAC command reconstructed by PyABF' if is_command else 'Recorded ADC current monitor'} "
                         f"from channel {stimulus_source['channel']} for sweep {i}; "
-                        f"native unit {command_native_unit}."
+                        f"native unit {command_native_unit}; "
+                        f"selection={stimulus_source['selection_reason']}."
                     ),
                 )
 
@@ -429,6 +447,47 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         abf_nwbfile.add_acquisition(abf_response)
         if abf_stimulus is not None:
             abf_nwbfile.add_stimulus(abf_stimulus)
+
+        # Preserve every other active DAC waveform. Matching sweep indices
+        # establishes alignment but cannot identify which DAC drove the cell.
+        for alternate_dac in (stimulus_source or {}).get("alternative_channels", []):
+            alternate_source = {
+                "source": "dac_command", "channel": alternate_dac,
+                "unit": str(abf.dacUnits[alternate_dac]),
+            }
+            alternate_data, alternate_native_unit = (
+                util_functions.get_stimulus_waveform(abf, i, alternate_source)
+            )
+            if alternate_data.shape != response_data.shape:
+                raise ValueError(
+                    f"Alternate DAC{alternate_dac} length mismatch in "
+                    f"{filename}, sweep {i}"
+                )
+            alternate_conversion, alternate_unit = nwb_conversion_from_unit(
+                alternate_native_unit
+            )
+            stimulus_class = (
+                VoltageClampStimulusSeries if clamp_mode == "voltage_clamp"
+                else CurrentClampStimulusSeries
+            )
+            abf_nwbfile.add_stimulus(stimulus_class(
+                name=f"stimulus_sweep_{i:04d}_dac{alternate_dac}",
+                data=alternate_data,
+                unit=alternate_unit,
+                conversion=alternate_conversion,
+                starting_time=sweep_start_time,
+                rate=rate,
+                electrode=abf_electrode_rec,
+                sweep_number=np.uint64(i),
+                stimulus_description="Additional ABF command candidate",
+                description=(
+                    f"Additional DAC{alternate_dac} command waveform for "
+                    f"sweep {i}; native unit {alternate_native_unit}. "
+                    "Source selection is documented in conversion_metadata."
+                ),
+            ))
+
+        if abf_stimulus is not None and not unverified_dac:
             rec_idx = abf_nwbfile.add_intracellular_recording(
                 electrode=abf_electrode_rec,
                 stimulus=abf_stimulus,
@@ -446,7 +505,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
 
         # Epoch times must be session-relative. Add each sweep's start time so
         # the interval start times are not repeated for every sweep.
-        if abf_stimulus is not None:
+        if abf_stimulus is not None and not unverified_dac:
             if stimulus_source["source"] == "recorded_current_adc":
                 stim_start, stim_end, stim_amp, stim_mode = (
                     util_functions.detect_long_square_from_current_trace(
