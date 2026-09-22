@@ -54,6 +54,10 @@ PAPER_DOI = "https://doi.org/10.1093/gigascience/giac108"
 VOLTAGE_UNITS = {"v", "mv", "uv"}
 CURRENT_UNITS = {"a", "ma", "ua", "na", "pa"}
 
+# Set a filename to a DAC index only after reviewing an ABF with multiple
+# active outputs of the same unit (for example, {"sample.abf": 1}).
+COMMAND_DAC_OVERRIDES = {}
+
 # Cell Data missing Metadata
 dates_missing = set()
 
@@ -61,17 +65,23 @@ converted = 0
 failures = []
 
 def nwb_conversion_from_unit(unit):
-    unit = unit.lower()
+    unit = util_functions.normalize_unit(unit)
     if unit == "mv":
         return 1e-3, "volts"
     if unit == "v":
         return 1.0, "volts"
+    if unit == "uv":
+        return 1e-6, "volts"
     if unit == "pa":
         return 1e-12, "amperes"
     if unit == "na":
         return 1e-9, "amperes"
     if unit == "ua":
         return 1e-6, "amperes"
+    if unit == "ma":
+        return 1e-3, "amperes"
+    if unit == "a":
+        return 1.0, "amperes"
     raise ValueError(f"Unhandled ABF unit: {unit}")
 
 def _clean_optional(value: Any) -> Any | None:
@@ -248,6 +258,19 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
             f"Could not determine clamp mode for {filename}"
         )
 
+    # The stimulus waveform display shows DAC outputs, which need not have
+    # the same index as the recorded voltage/current response ADC.
+    stimulus_source = util_functions.find_stimulus_source(
+        abf, clamp_mode, recorded_channel=stim_channel,
+        response_channel=response_channel,
+        dac_override=COMMAND_DAC_OVERRIDES.get(filename),
+    )
+    if clamp_mode != "izero" and stimulus_source is None:
+        warnings.warn(
+            f"No trustworthy stimulus found for {filename}; recording the "
+            "response without a fabricated zero-valued stimulus."
+        )
+
     # Add the amplifier/device with a non-empty description.
     try:
         device_name = str(abf._adcSection.sTelegraphInstrument[response_channel]).strip()
@@ -310,15 +333,27 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
 
         relative_time = np.array(abf.sweepX, copy=True)
         response_data = np.array(abf.sweepY, copy=True)
-        command_data = np.array(abf.sweepC, copy=True)
+        stimulus_result = util_functions.get_stimulus_waveform(
+            abf, i, stimulus_source,
+        )
+        if stimulus_result is None:
+            command_data = None
+            command_native_unit = None
+        else:
+            command_data, command_native_unit = stimulus_result
+            if command_data.shape != response_data.shape:
+                raise ValueError(
+                    f"Stimulus/response length mismatch in {filename}, "
+                    f"sweep {i}: {command_data.shape} != {response_data.shape}"
+                )
         abf_stimulus = None
 
-        response_conversion, response_unit = nwb_conversion_from_unit(abf.sweepUnitsY)
+        response_conversion, response_unit = nwb_conversion_from_unit(adc_unit)
         rate = float(file_metadata["acquisition"]["sample_rate"])
         response_description = (
             f"Recorded {clamp_mode.replace('_', ' ')} response for ABF sweep {i}; "
             f"source ADC channel {response_channel} ({abf.adcNames[response_channel]}), "
-            f"native unit {abf.sweepUnitsY}."
+            f"native unit {adc_unit}."
         )
 
         response_common = dict(
@@ -337,48 +372,53 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         if clamp_mode == "voltage_clamp":
             abf_response = VoltageClampSeries(
                 **response_common,
-                stimulus_description="Long Square voltage command",
+                stimulus_description="ABF voltage command",
             )
-            stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(abf.sweepUnitsC)
-            abf_stimulus = VoltageClampStimulusSeries(
-                name=f"stimulus_sweep_{i:04d}",
-                data=command_data,
-                unit=stimulus_unit,
-                conversion=stimulus_conversion,
-                starting_time=sweep_start_time,
-                rate=rate,
-                electrode=abf_electrode_rec,
-                sweep_number=np.uint64(i),
-                stimulus_description="Long Square voltage command",
-                description=(
-                    f"Ideal command waveform reconstructed by PyABF for sweep {i}; "
-                    f"native unit {abf.sweepUnitsC}."
-                ),
-                comments="Command stimulus associated with the paired voltage-clamp response.",
-            )
+            if command_data is not None:
+                stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(command_native_unit)
+                abf_stimulus = VoltageClampStimulusSeries(
+                    name=f"stimulus_sweep_{i:04d}",
+                    data=command_data,
+                    unit=stimulus_unit,
+                    conversion=stimulus_conversion,
+                    starting_time=sweep_start_time,
+                    rate=rate,
+                    electrode=abf_electrode_rec,
+                    sweep_number=np.uint64(i),
+                    stimulus_description="ABF voltage command",
+                    description=(
+                        f"Ideal DAC{stimulus_source['channel']} command reconstructed "
+                        f"by PyABF for sweep {i}; native unit {command_native_unit}."
+                    ),
+                )
 
         elif clamp_mode == "current_clamp":
             abf_response = CurrentClampSeries(
                 **response_common,
-                stimulus_description="Long Square current command",
+                stimulus_description="ABF current stimulus",
             )
-            stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(abf.sweepUnitsC)
-            abf_stimulus = CurrentClampStimulusSeries(
-                name=f"stimulus_sweep_{i:04d}",
-                data=command_data,
-                unit=stimulus_unit,
-                conversion=stimulus_conversion,
-                starting_time=sweep_start_time,
-                rate=rate,
-                electrode=abf_electrode_rec,
-                sweep_number=np.uint64(i),
-                stimulus_description="Long Square current command",
-                description=(
-                    f"Ideal command waveform reconstructed by PyABF for sweep {i}; "
-                    f"native unit {abf.sweepUnitsC}."
-                ),
-                comments="Command stimulus associated with the paired current-clamp response.",
-            )
+            if command_data is not None:
+                stimulus_conversion, stimulus_unit = nwb_conversion_from_unit(command_native_unit)
+                is_command = stimulus_source["source"] == "dac_command"
+                abf_stimulus = CurrentClampStimulusSeries(
+                    name=f"stimulus_sweep_{i:04d}",
+                    data=command_data,
+                    unit=stimulus_unit,
+                    conversion=stimulus_conversion,
+                    starting_time=sweep_start_time,
+                    rate=rate,
+                    electrode=abf_electrode_rec,
+                    sweep_number=np.uint64(i),
+                    stimulus_description=(
+                        "ABF current command" if is_command
+                        else "Recorded current monitor"
+                    ),
+                    description=(
+                        f"{'Ideal DAC command reconstructed by PyABF' if is_command else 'Recorded ADC current monitor'} "
+                        f"from channel {stimulus_source['channel']} for sweep {i}; "
+                        f"native unit {command_native_unit}."
+                    ),
+                )
 
         elif clamp_mode == "izero":
             abf_response = IZeroClampSeries(**response_common)
@@ -407,10 +447,18 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         # Epoch times must be session-relative. Add each sweep's start time so
         # the interval start times are not repeated for every sweep.
         if abf_stimulus is not None:
-            stim_start, stim_end, stim_amp, stim_mode = util_functions.stim_range(
-                command_data,
-                relative_time,
-            )
+            if stimulus_source["source"] == "recorded_current_adc":
+                stim_start, stim_end, stim_amp, stim_mode = (
+                    util_functions.detect_long_square_from_current_trace(
+                        relative_time, command_data,
+                        min_step_amp=5.0 / (stimulus_conversion / 1e-12),
+                    )
+                )
+            else:
+                holding = float(np.median(command_data[:max(1, len(command_data) // 20)]))
+                stim_start, stim_end, stim_amp, stim_mode = util_functions.stim_range(
+                    command_data - holding, relative_time,
+                )
             if stim_start is not None:
                 abf_nwbfile.add_epoch(
                     start_time=sweep_start_time + float(stim_start),
@@ -423,7 +471,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
     if simultaneous_recordings:
         abf_nwbfile.add_icephys_sequential_recording(
             simultaneous_recordings=simultaneous_recordings,
-            stimulus_type="Long Square",
+            stimulus_type="ABF stimulus waveform",
         )
 
     # Preserve the complete normalized metadata and its extraction sources in
@@ -439,6 +487,7 @@ def convert_abf_to_nwb(dirpath, filename, species = "human"):
         "selected_channels": {
             "response_adc_channel": response_channel,
             "recorded_stimulus_adc_channel": stim_channel,
+            "stimulus_source": stimulus_source,
             "clamp_mode": clamp_mode,
         },
     }
