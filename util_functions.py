@@ -1494,7 +1494,7 @@ def find_command_dac_candidates(abf, clamp_mode, zero_tol=1e-9):
 
 
 def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
-    """Return one DAC index for older callers; see find_stimulus_source for QA."""
+    """Return one DAC index for older callers; refuse an unsupported tie."""
     candidates = find_command_dac_candidates(abf, clamp_mode, zero_tol)
     indices = [item["channel"] for item in candidates]
     if override is not None:
@@ -1502,7 +1502,26 @@ def find_command_dac_index(abf, clamp_mode, override=None, zero_tol=1e-9):
             raise ValueError(f"DAC override {override} is not active: {indices}")
         return int(override)
     enabled = [item["channel"] for item in candidates if item["enabled"]]
+    if len(indices) > 1 and len(enabled) != 1:
+        raise ValueError(
+            f"Multiple active DACs: {indices}. Use find_stimulus_source "
+            "to retain all candidates, or specify an override."
+        )
     return (enabled or indices or [None])[0]
+
+
+def _dac_commands_identical(abf, indices):
+    """An identical command on every sweep makes either DAC equivalent."""
+    if len({normalize_unit(abf.dacUnits[ch]) for ch in indices}) != 1:
+        return False
+    for sweep in abf.sweepList:
+        abf.setSweep(int(sweep), channel=indices[0])
+        reference = np.array(abf.sweepC, copy=True)
+        for channel in indices[1:]:
+            abf.setSweep(int(sweep), channel=channel)
+            if not np.allclose(reference, abf.sweepC, rtol=1e-6, atol=1e-9):
+                return False
+    return True
 
 
 def _command_monitor_correlation(abf, dac, recorded_channel):
@@ -1549,9 +1568,12 @@ def find_stimulus_source(abf, clamp_mode, recorded_channel=None,
         elif len(candidates) == 1:
             chosen = indices[0]
         else:
+            if _dac_commands_identical(abf, indices):
+                chosen, reason = indices[0], "identical_dac_commands"
             # The acquired current monitor can identify a command by its
             # timing and amplitude pattern, even if both DACs have pA units.
-            if (clamp_mode == "current_clamp" and recorded_channel is not None
+            if (chosen is None and clamp_mode == "current_clamp"
+                    and recorded_channel is not None
                     and recorded_channel != response_channel
                     and normalize_unit(abf.adcUnits[recorded_channel])
                     in {"a", "ma", "ua", "na", "pa"}):
